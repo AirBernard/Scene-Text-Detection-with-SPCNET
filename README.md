@@ -6,10 +6,10 @@ Unofficial repository for [Scene Text Detection with Supervised Pyramid Context 
 ### 1、训练数据准备
 训练数据放在data/下，训练数据准备在data/icdar.py：
 >data
->>icdar2017
->>>Annotaions  //image_1.txt
->>>JPEGImages  //image_1.jpg
->>>train.txt   //存储训练图片的名称，例如：image_1
+>>icdar2017  
+>>>Annotaions  //image_1.txt  
+>>>JPEGImages  //image_1.jpg  
+>>>train.txt   //存储训练图片的名称，例如：image_1  
 ### 2、参数修改
 修改./train.py中的学习率、batch、模型存储路径等参数，如果需要调整网络参数，在nets/config.py中修改。
 ### 3、执行训练
