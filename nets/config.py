@@ -8,7 +8,7 @@ Written by Waleed Abdulla
 """
 
 import numpy as np
-
+import random
 
 # Base Configuration Class
 # Don't use this class directly. Instead, sub-class it and override
@@ -169,7 +169,7 @@ class Config(object):
 
     # Minimum probability value to accept a detected instance
     # ROIs below this threshold are skipped
-    DETECTION_MIN_CONFIDENCE = 0.7
+    DETECTION_MIN_CONFIDENCE = 0.8
 
     # Non-maximum suppression threshold for detection
     DETECTION_NMS_THRESHOLD = 0.3
@@ -195,7 +195,7 @@ class Config(object):
         "mrcnn_class_loss": 1.,
         "mrcnn_bbox_loss": 1.,
         "mrcnn_mask_loss": 1.,
-        "gts_mask_loss": 1.
+        "global_mask_loss": 1.
     }
 
     # Use RPN ROIs or externally generated ROIs for training

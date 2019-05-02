@@ -17,13 +17,10 @@ import scipy
 import skimage.color
 import skimage.io
 import skimage.transform
-import urllib.request
 import shutil
 import warnings
 from distutils.version import LooseVersion
-
-# URL from which to download the latest COCO trained weights
-COCO_MODEL_URL = "https://github.com/matterport/Mask_RCNN/releases/download/v2.0/mask_rcnn_coco.h5"
+import cv2
 
 
 ############################################################
@@ -278,7 +275,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
     # Scale?
     if min_dim:
         # Scale up but not down
-        scale = max(1, min_dim / min(h, w))
+        scale = max(1.0, min_dim * 1.0 / min(h, w))
     if min_scale and scale < min_scale:
         scale = min_scale
 
@@ -286,7 +283,7 @@ def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square
     if max_dim and mode == "square":
         image_max = max(h, w)
         if round(image_max * scale) > max_dim:
-            scale = max_dim / image_max
+            scale = max_dim * 1.0 / image_max
 
     # Resize image using bilinear interpolation
     if scale != 1:
@@ -415,7 +412,6 @@ def unmold_mask(mask, bbox, image_shape):
     y1, x1, y2, x2 = bbox
     mask = resize(mask, (y2 - y1, x2 - x1))
     mask = np.where(mask >= threshold, 1, 0).astype(np.bool)
-
     # Put the mask in the right location.
     full_mask = np.zeros(image_shape[:2], dtype=np.bool)
     full_mask[y1:y2, x1:x2] = mask
@@ -446,8 +442,8 @@ def generate_anchors(scales, ratios, shape, feature_stride, anchor_stride):
     widths = scales * np.sqrt(ratios)
 
     # Enumerate shifts in feature space
-    shifts_y = np.arange(0, shape[0], anchor_stride) * feature_stride
-    shifts_x = np.arange(0, shape[1], anchor_stride) * feature_stride
+    shifts_y = np.arange(0, int(shape[0]), anchor_stride) * feature_stride
+    shifts_x = np.arange(0, int(shape[1]), anchor_stride) * feature_stride
     shifts_x, shifts_y = np.meshgrid(shifts_x, shifts_y)
 
     # Enumerate combinations of shifts, widths, and heights
@@ -497,6 +493,19 @@ def trim_zeros(x):
     """
     assert len(x.shape) == 2
     return x[~np.all(x == 0, axis=1)]
+
+def trim_zeros_graph(boxes, name=None):
+    """
+    Often boxes are represented with matrices of shape [N, 4] and
+    are padded with zeros. This removes zero boxes.
+
+    boxes: [N, 4] matrix of boxes.
+    non_zeros: [N] a 1D boolean mask identifying the rows to keep
+    """
+    none_zeros = tf.cast(tf.reduce_max(boxes, axis=1), tf.bool)
+    # none_zeros = tf.Print(none_zeros, ['boxes: ', boxes, ' none_zeros: ', none_zeros], summarize=100)
+    boxes = tf.boolean_mask(boxes, none_zeros, name=name)
+    return boxes, none_zeros
 
 
 def compute_matches(gt_boxes, gt_class_ids, gt_masks,
@@ -646,7 +655,7 @@ def compute_recall(pred_boxes, gt_boxes, iou):
 # an easy way to support batches > 1 quickly with little code modification.
 # In the long run, it's more efficient to modify the code to support large
 # batches and getting rid of this function. Consider this a temporary solution
-def batch_slice(inputs, graph_fn, batch_size, names=None):
+def batch_slice(inputs, graph_fn, batch_size, config=None, names=None):
     """Splits inputs into slices and feeds each slice to a copy of the given
     computation graph and then combines the results. It allows you to run a
     graph on a batch of inputs even if the graph is written to support one
@@ -663,6 +672,8 @@ def batch_slice(inputs, graph_fn, batch_size, names=None):
     outputs = []
     for i in range(batch_size):
         inputs_slice = [x[i] for x in inputs]
+        if config is not None:
+            inputs_slice.append(config)
         output_slice = graph_fn(*inputs_slice)
         if not isinstance(output_slice, (tuple, list)):
             output_slice = [output_slice]
@@ -707,9 +718,9 @@ def norm_boxes(boxes, shape):
     Returns:
         [N, (y1, x1, y2, x2)] in normalized coordinates
     """
-    h, w = shape
-    scale = np.array([h - 1, w - 1, h - 1, w - 1])
-    shift = np.array([0, 0, 1, 1])
+    h, w, _ = shape
+    scale = np.array([h - 1, w - 1, h - 1, w - 1]).astype(np.float32)
+    shift = np.array([0, 0, 1, 1]).astype(np.float32)
     return np.divide((boxes - shift), scale).astype(np.float32)
 
 
@@ -752,6 +763,7 @@ def resize(image, output_shape, order=1, mode='constant', cval=0, clip=True,
             image, output_shape,
             order=order, mode=mode, cval=cval, clip=clip,
             preserve_range=preserve_range)
+    
 
 def apply_box_deltas_graph(boxes, deltas):
     """Applies the given deltas to the given boxes.
@@ -839,3 +851,141 @@ def batch_pack_graph(x, counts, num_rows):
         outputs.append(x[i, :counts[i]])
     return tf.concat(outputs, axis=0)
 
+def overlaps_graph(boxes1, boxes2):
+    '''
+    Compute IOU overlaps between two sets of boxes
+    boxes1, boxes2: [N, (y1, x1, y2, x2)]
+    '''
+    # 1. Tile boxes2 and repeat boxes1. This allows us to compare
+    # every boxes1 against every boxes2 without loops.
+    # TF doesn't have an equivalent to np.repeat() so simulate it
+    # using tf.tile() and tf.reshape.
+    b1 = tf.reshape(tf.tile(tf.expand_dims(boxes1, 1),\
+                    [1, 1, tf.shape(boxes2)[0]]), [-1,4])
+    b2 = tf.tile(boxes2, [tf.shape(boxes1)[0], 1])
+    # 2. Compute intersections
+    b1_y1, b1_x1, b1_y2, b1_x2 = tf.split(b1, 4, axis=1)
+    b2_y1, b2_x1, b2_y2, b2_x2 = tf.split(b2, 4, axis=1)
+    y1 = tf.maximum(b1_y1, b2_y1)
+    x1 = tf.maximum(b1_x1, b2_x1)
+    y2 = tf.minimum(b1_y2, b2_y2)
+    x2 = tf.minimum(b1_x2, b2_x2)
+    intersections = tf.maximum(x2 - x1, 0) * tf.maximum(y2 - y1, 0)
+    # 3. Compute unions
+    b1_area = (b1_y2 - b1_y1) * (b1_x2 - b1_x1)
+    b2_area = (b2_y2 - b2_y1) * (b2_x2 - b2_x1)
+    union = b1_area + b2_area - intersections
+    # 4. Compute IoU and reshape to [boxes1_num, boxes2_num]
+    iou = intersections / union
+    overlaps = tf.reshape(iou, [tf.shape(boxes1)[0], tf.shape(boxes2)[0]])
+    return overlaps
+    
+def box_refinement_graph(box, gt_box):
+    '''
+    Compute refinement needed to transform box to 
+    gt_box. box and gt_box are [N, (y1, x1, y2, x2)]
+    '''
+    box = tf.cast(box, tf.float32)
+    gt_box = tf.cast(gt_box, tf.float32)
+
+    height = box[:,2] - box[:,0]
+    width = box[:,3] - box[:,1]
+    center_y = box[:,0] + 0.5 * height
+    center_x = box[:,1] + 0.5 * width
+    
+    gt_height = gt_box[:,2] - gt_box[:,0]
+    gt_width = gt_box[:,3] - gt_box[:,1]
+    gt_center_y = gt_box[:,0] + 0.5 * gt_height
+    gt_center_x = gt_box[:,1] + 0.5 * gt_width
+
+    dy = (gt_center_y - center_y) / height
+    dx = (gt_center_x - center_x) / width
+    dh = tf.log(gt_height / height)
+    dw = tf.log(gt_width / width)
+
+    result = tf.stack([dy, dx, dh, dw], axis=1)
+    return result
+
+
+def unmold_detections(detections, mrcnn_mask, original_image_shape,
+                          image_shape, window):
+        """Reformats the detections of one image from the format of the neural
+        network output to a format suitable for use in the rest of the
+        application.
+
+        detections: [N, (y1, x1, y2, x2, class_id, score)] in normalized coordinates
+        mrcnn_mask: [N, height, width, num_classes]
+        original_image_shape: [H, W, C] Original image shape before resizing
+        image_shape: [H, W, C] Shape of the image after resizing and padding
+        window: [y1, x1, y2, x2] Pixel coordinates of box in the image where the real
+                image is excluding the padding.
+
+        Returns:
+        boxes: [N, (y1, x1, y2, x2)] Bounding boxes in pixels
+        class_ids: [N] Integer class IDs for each bounding box
+        scores: [N] Float probability scores of the class_id
+        masks: [height, width, num_instances] Instance masks
+        boundboxes: [N, (x1, y1, x2, y2, x3, y3, x4, y4)]
+        """
+        # How many detections do we have?
+        # Detections array is padded with zeros. Find the first class_id == 0.
+        zero_ix = np.where(detections[:, 4] == 0)[0]
+        N = zero_ix[0] if zero_ix.shape[0] > 0 else detections.shape[0]
+	
+        # Extract boxes, class_ids, scores, and class-specific masks
+        boxes = detections[:N, :4]
+        class_ids = detections[:N, 4].astype(np.int32)
+        scores = detections[:N, 5]
+        masks = mrcnn_mask[np.arange(N), :, :, class_ids]
+        
+	# Translate normalized coordinates in the resized image to pixel
+        # coordinates in the original image before resizing
+        window = norm_boxes(window, image_shape)
+        wy1, wx1, wy2, wx2 = window
+        shift = np.array([wy1, wx1, wy1, wx1])
+        wh = wy2 - wy1  # window height
+        ww = wx2 - wx1  # window width
+        scale = np.array([wh, ww, wh, ww])
+	# clip the boxes to window area
+	boxes[:,[0,2]] = np.clip(boxes[:,[0,2]], wy1, wy2)
+	boxes[:,[1,3]] = np.clip(boxes[:,[1,3]], wx1, wx2)
+        # Convert boxes to normalized coordinates on the window
+        boxes = np.divide(boxes - shift, scale)
+        # Convert boxes to pixel coordinates on the original image
+        boxes = denorm_boxes(boxes, original_image_shape[:2])
+
+        # Filter out detections with zero area. Happens in early training when
+        # network weights are still random
+        exclude_ix = np.where(
+            (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1]) <= 0)[0]
+	if exclude_ix.shape[0] > 0:
+            boxes = np.delete(boxes, exclude_ix, axis=0)
+            class_ids = np.delete(class_ids, exclude_ix, axis=0)
+            scores = np.delete(scores, exclude_ix, axis=0)
+            masks = np.delete(masks, exclude_ix, axis=0)
+            N = class_ids.shape[0]
+        
+	# Resize masks to original image size and set boundary threshold.
+        full_masks = []
+        bound_boxes = []
+        for i in range(N):
+            # Convert neural network mask to full size mask
+            full_mask = unmold_mask(masks[i], boxes[i], original_image_shape)
+            # find mask's bounding box 
+            # pints [N, (y,x)]
+            points = np.argwhere(full_mask == True).reshape((-1,2))
+            if points.shape[0] == 0:
+		continue
+            # [N, (x,y)]
+            points[:,[0,1]] = points[:,[1,0]]
+            rect = cv2.minAreaRect(points)
+            # (x1, y1, x2, y2, x3, y3, x4, y4)
+            boundbox = cv2.boxPoints(rect).reshape((8))
+            bound_boxes.append(boundbox)
+            full_masks.append(full_mask)
+        full_masks = np.stack(full_masks, axis=-1)\
+            if full_masks else np.empty(original_image_shape[:2] + (0,))
+        bound_boxes = np.stack(bound_boxes, axis=0)\
+            if bound_boxes else np.empty((0,8))
+
+        return boxes, class_ids, scores, full_masks, bound_boxes
