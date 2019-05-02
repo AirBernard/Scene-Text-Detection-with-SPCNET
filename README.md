@@ -17,6 +17,7 @@ python train.py
 > 代码运行环境：Python2.7 tensorflow-gpu1.13 单张1080Ti
 ## 测试
 修改demo.py中的模型文件夹路径、测试图片路径，然后执行python demo.py
+> 测试结果：论文中还有一些地方我也不确定，因此目前没有在公开数据集测试。值得注意的是，按照原文中的训练说明，最好在多卡上训练，请加大你的batch size.
 ## 值得注意的地方
 ### 1、global text segmentation（gts）的训练
 计算gts训练时损失函数时，我采用的方法是将feature pyramid的各个level产生的gts分别与全局mask gt计算softmax loss,然后取平均作为Loss_gts。因为没找到与原文关于这一块的描述，因此可能是其他的计算方法：每个level准备不同的mask_gt、将多个level的gts预测融合计算loss等等。感兴趣的可以去问问作者或者自己试试。
